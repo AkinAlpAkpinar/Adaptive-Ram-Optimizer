@@ -20,7 +20,8 @@ from sklearn.ensemble import RandomForestClassifier
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QLabel, QPushButton, QFrame, QSystemTrayIcon, QMenu,
                              QMessageBox, QDialog, QFormLayout, QDoubleSpinBox,
-                             QSpinBox, QDialogButtonBox, QLineEdit, QTextEdit)
+                             QSpinBox, QDialogButtonBox, QLineEdit, QTextEdit,
+                             QGridLayout)
 from PyQt6.QtCore import QThread, pyqtSignal, Qt, QSettings, QTimer
 from PyQt6.QtGui import QAction, QActionGroup, QFont, QFontDatabase, QColor
 
@@ -281,6 +282,12 @@ LANGUAGE_PACKS = {
         "telemetry_tick": "Monitoring | Events: {events} | RAM: {ram}%",
         "optimize_now": "Optimize RAM Now",
         "optimization_complete": "Manual optimization complete: {count} processes, {memory:.2f} MB released.",
+        "decision_inspector": "Optimization Decision Inspector",
+        "decision_waiting": "Waiting for the next optimization interval",
+        "decision_pass": "Last pass: {status}",
+        "decision_params": "Threshold: {threshold}% | Interval: {interval}s | Cooldown: {cooldown}s | Background: {background}s",
+        "decision_counts": "Scanned: {scanned} | AI candidates: {candidates} | Eligible: {eligible} | Trimmed: {trimmed} | Skipped: {skipped} (model {model}, size {size}, cooldown {cooldown})",
+        "decision_reason": "Why: {reason}",
     },
     "tr": {
     "language": "Dil", "english": "İngilizce", "turkish": "Türkçe",
@@ -325,6 +332,12 @@ LANGUAGE_PACKS = {
     "telemetry_tick": "İzleme | Olay: {events} | RAM: %{ram}",
     "optimize_now": "RAM'i Şimdi Optimize Et",
     "optimization_complete": "Manuel optimizasyon tamamlandı: {count} süreç, {memory:.2f} MB RAM azaltıldı.",
+    "decision_inspector": "Optimizasyon Karar Denetçisi",
+    "decision_waiting": "Bir sonraki optimizasyon aralığı bekleniyor",
+    "decision_pass": "Son tur: {status}",
+    "decision_params": "Eşik: %{threshold} | Aralık: {interval} sn | Cooldown: {cooldown} sn | Arka plan: {background} sn",
+    "decision_counts": "Taranan: {scanned} | AI adayı: {candidates} | Uygun: {eligible} | Temizlenen: {trimmed} | Atlanan: {skipped} (model {model}, boyut {size}, cooldown {cooldown})",
+    "decision_reason": "Neden: {reason}",
 }
 }
 PROTECTED_PROCESS_NAMES = {
@@ -538,6 +551,7 @@ class EventDrivenTelemetryWorker(QThread):
         self._last_gpu_sample_at = 0.0
         self._last_gpu_utilization = None
         self._last_optimization_at = 0.0
+        self._last_background_pass_at = 0.0
         self._lowered_priority_pids = set()
         self._event_count = 0
         self._runtime = RuntimeTelemetry()
@@ -546,6 +560,13 @@ class EventDrivenTelemetryWorker(QThread):
         self._active_focus_pid = 0
         self._active_focus_title = ""
         self._last_dashboard_data = {}
+        self._last_optimization_data = {
+            "status": "Waiting",
+            "reason": "No optimization pass has run yet",
+            "scanned": 0, "eligible": 0, "trimmed": 0, "skipped": 0,
+            "skipped_model": 0, "skipped_size": 0, "skipped_cooldown": 0,
+            "attempted": 0, "failed": 0,
+        }
         self.load_ml_model()
 
     def load_ml_model(self):
@@ -902,8 +923,47 @@ class EventDrivenTelemetryWorker(QThread):
                 try:
                     event = self._events.get(timeout=1.0)
                 except queue.Empty:
-                    self._emit_live_dashboard_data()
-                    continue
+                    mode = OPTIMIZATION_MODES.get(
+                        self.optimization_mode, OPTIMIZATION_MODES["balanced"]
+                    )
+                    now_monotonic = time.monotonic()
+                    ram_percent = psutil.virtual_memory().percent
+                    if (
+                        now_monotonic - self._last_background_pass_at
+                        >= mode["interval_sec"]
+                    ):
+                        if ram_percent < mode["ram_percent"]:
+                            self._emit_live_dashboard_data()
+                            continue
+                        foreground_window = user32.GetForegroundWindow()
+                        foreground_pid_value = wintypes.DWORD()
+                        user32.GetWindowThreadProcessId(
+                            foreground_window, ctypes.byref(foreground_pid_value)
+                        )
+                        foreground_pid = foreground_pid_value.value
+                        title_buffer = ctypes.create_unicode_buffer(512)
+                        user32.GetWindowTextW(
+                            foreground_window, title_buffer, len(title_buffer)
+                        )
+                        timestamp_ms = int(time.time() * 1000)
+                        event = TelemetryData(
+                            process_id=foreground_pid,
+                            process_name=_process_name(foreground_pid),
+                            window_title=title_buffer.value,
+                            timestamp=timestamp_ms,
+                            previous_focus_duration_ms=(
+                                max(0, timestamp_ms - self._last_event_ms)
+                                if self._last_event_ms is not None
+                                else 0
+                            ),
+                            active_focus_duration_ms=0,
+                            event_id=4,
+                            event_status=0,
+                        )
+                        self._last_background_pass_at = now_monotonic
+                    else:
+                        self._emit_live_dashboard_data()
+                        continue
                 if event is None:
                     break
                 if isinstance(event, tuple) and event[0] == "manual_optimization":
@@ -933,70 +993,81 @@ class EventDrivenTelemetryWorker(QThread):
                     continue
                 if self.collection_paused:
                     continue
-                self._event_count += 1
+                is_periodic_pass = event.event_id == 4
+                if not is_periodic_pass:
+                    self._event_count += 1
 
                 process_name = event.process_name or "Unknown"
                 title = event.window_title
-                self._active_focus_name = process_name
-                self._active_focus_pid = event.process_id
-                self._active_focus_title = title
-                priority_was_managed = event.process_id in self._priority_processes
-                managed_process_name = self._priority_process_names.get(
-                    event.process_id, process_name
-                )
-                self._restore_foreground_priority(event.process_id)
-                if priority_was_managed:
-                    self._record_safety_outcome(
-                        connection, managed_process_name, "user_override"
+                if not is_periodic_pass:
+                    self._active_focus_name = process_name
+                    self._active_focus_pid = event.process_id
+                    self._active_focus_title = title
+                    priority_was_managed = event.process_id in self._priority_processes
+                    managed_process_name = self._priority_process_names.get(
+                        event.process_id, process_name
                     )
-                self._focus_started_at = time.monotonic()
-                self._log(
-                    f"[EVENT] Focus changed to: {process_name} "
-                    f"(PID {event.process_id}). ARMING 2s evaluation timer."
-                )
+                    self._restore_foreground_priority(event.process_id)
+                    if priority_was_managed:
+                        self._record_safety_outcome(
+                            connection, managed_process_name, "user_override"
+                        )
+                    self._focus_started_at = time.monotonic()
+                    self._log(
+                        f"[EVENT] Focus changed to: {process_name} "
+                        f"(PID {event.process_id}). ARMING 2s evaluation timer."
+                    )
                 now_monotonic = time.monotonic()
                 if (
+                    not is_periodic_pass
+                    and
                     process_name == self._last_processed_process
                     and now_monotonic - self._last_processed_at
                     < FOREGROUND_PROCESS_MIN_INTERVAL_SEC
                 ):
                     continue
-                self._last_processed_process = process_name
-                self._last_processed_at = now_monotonic
-                self._log(f"Odak olayı işlendi: {process_name} (PID {event.process_id})")
+                if not is_periodic_pass:
+                    self._last_processed_process = process_name
+                    self._last_processed_at = now_monotonic
+                    self._log(
+                        f"Odak olayı işlendi: {process_name} (PID {event.process_id})"
+                    )
                 timestamp = datetime.datetime.fromtimestamp(
                     event.timestamp / 1000, datetime.timezone.utc
                 ).astimezone()
                 timestamp_text = timestamp.strftime("%Y-%m-%d %H:%M:%S")
-                if session_id is not None:
+                if not is_periodic_pass and session_id is not None:
                     connection.execute(
                         "UPDATE foreground_sessions SET ended_at=?, duration_sec=? "
                         "WHERE session_id=?",
                         (timestamp_text, event.previous_focus_duration_ms / 1000, session_id),
                     )
-                if previous_name and previous_name != process_name:
+                if not is_periodic_pass and previous_name and previous_name != process_name:
                     connection.execute(
                         "INSERT INTO app_transitions "
                         "(from_process,to_process,hour,weekday,occurred_at) VALUES (?,?,?,?,?)",
                         (previous_name, process_name, timestamp.hour,
                          timestamp.weekday(), timestamp_text),
                     )
-                cursor = connection.execute(
-                    "INSERT INTO foreground_sessions "
-                    "(pid,process_name,window_title,started_at) VALUES (?,?,?,?)",
-                    (event.process_id, process_name, title, timestamp_text),
-                )
-                session_id = cursor.lastrowid
-                connection.execute(
-                    "INSERT INTO event_telemetry "
-                    "(timestamp,pid,process_name,window_title,previous_focus_duration_ms) "
-                    "VALUES (?,?,?,?,?)",
-                    (event.timestamp, event.process_id, process_name, title,
-                     event.previous_focus_duration_ms),
-                )
+                if not is_periodic_pass:
+                    cursor = connection.execute(
+                        "INSERT INTO foreground_sessions "
+                        "(pid,process_name,window_title,started_at) VALUES (?,?,?,?)",
+                        (event.process_id, process_name, title, timestamp_text),
+                    )
+                    session_id = cursor.lastrowid
+                if not is_periodic_pass:
+                    connection.execute(
+                        "INSERT INTO event_telemetry "
+                        "(timestamp,pid,process_name,window_title,previous_focus_duration_ms) "
+                        "VALUES (?,?,?,?,?)",
+                        (event.timestamp, event.process_id, process_name, title,
+                         event.previous_focus_duration_ms),
+                    )
                 connection.commit()
                 self._log("Odak ve geçiş telemetrisi kaydedildi.")
-                previous_name = process_name
+                if not is_periodic_pass:
+                    previous_name = process_name
                 predicted_next = self._predict_next(
                     connection, process_name, timestamp.hour
                 )
@@ -1113,7 +1184,25 @@ class EventDrivenTelemetryWorker(QThread):
                 optimization_due = (
                     now_monotonic - self._last_optimization_at >= mode["interval_sec"]
                 )
+                if not optimization_due:
+                    remaining = max(
+                        0.0, mode["interval_sec"] - (now_monotonic - self._last_optimization_at)
+                    )
+                    self._last_optimization_data = {
+                        **self._last_optimization_data,
+                        "status": f"Waiting ({remaining:.1f}s)",
+                        "reason": "Optimization interval has not elapsed",
+                    }
                 if optimization_due:
+                    test_mode = self.optimization_mode == "test"
+                    trim_scanned = 0
+                    trim_eligible = 0
+                    trim_skipped = 0
+                    skipped_model = 0
+                    skipped_size = 0
+                    skipped_cooldown = 0
+                    trim_attempted = 0
+                    trim_failed = 0
                     gpu_utilization = self._get_gpu_utilization()
                     gpu_busy = (
                         gpu_utilization is not None
@@ -1205,32 +1294,84 @@ class EventDrivenTelemetryWorker(QThread):
                                 f"(güven %{confidence * 100:.0f}, RAM bağımsız)."
                             )
 
-                        ram_pressure = system_memory.percent >= mode["ram_percent"]
-                        trim_allowed = (
-                            ram_pressure
-                            and metrics["working_set_mb"] >= MIN_WORKING_SET_MB
+                    # RAM trimming is deliberately independent from priority decisions.
+                    # Test mode bypasses the learned candidate gate so its result is observable.
+                    ram_pressure = system_memory.percent >= mode["ram_percent"]
+                    for pid, state in list(self._accumulators.items()):
+                        trim_scanned += 1
+                        metrics = process_metrics.get(pid)
+                        if (
+                            metrics is None
+                            or pid == event.process_id
+                            or _process_name(pid) in PROTECTED_PROCESS_NAMES
+                            or gpu_busy
+                        ):
+                            trim_skipped += 1
+                            continue
+                        if not ram_pressure:
+                            trim_skipped += 1
+                            continue
+                        if metrics["working_set_mb"] < MIN_WORKING_SET_MB:
+                            skipped_size += 1
+                            trim_skipped += 1
+                            continue
+                        prediction = predictions.get(pid, {})
+                        confidence = prediction.get("confidence", 0.0)
+                        if (
+                            not test_mode
+                            and self.model is not None
                             and (
-                                self.model is None
-                                or (
-                                    prediction.get("prediction") == 1
-                                    and confidence >= MODEL_CONFIDENCE_THRESHOLD
-                                )
+                                prediction.get("prediction") != 1
+                                or confidence < MODEL_CONFIDENCE_THRESHOLD
                             )
-                            and now_monotonic - self._last_trim_times.get(pid, 0.0)
-                            >= trim_cooldown_sec
+                        ):
+                            skipped_model += 1
+                            trim_skipped += 1
+                            continue
+                        if (
+                            now_monotonic - self._last_trim_times.get(pid, 0.0)
+                            < trim_cooldown_sec
+                        ):
+                            skipped_cooldown += 1
+                            trim_skipped += 1
+                            continue
+                        trim_eligible += 1
+                        trim_attempted += 1
+                        reduction = trim_process_memory(pid)
+                        if reduction is None:
+                            trim_failed += 1
+                            continue
+                        optimized_count += 1
+                        released_memory_mb += reduction
+                        self._runtime.ram_trims_count += 1
+                        self._runtime.accumulated_suppression_mb += reduction
+                        self._last_trim_times[pid] = now_monotonic
+                        self._log(
+                            f"AI RAM trim: PID {pid}, {reduction:.2f} MB azaltıldı."
                         )
-                        if trim_allowed:
-                            reduction = trim_process_memory(pid)
-                            if reduction is not None:
-                                optimized_count += 1
-                                released_memory_mb += reduction
-                                self._runtime.ram_trims_count += 1
-                                self._runtime.accumulated_suppression_mb += reduction
-                                self._last_trim_times[pid] = now_monotonic
-                                self._log(
-                                    f"AI RAM trim: PID {pid}, "
-                                    f"{reduction:.2f} MB azaltıldı."
-                                )
+                    if not ram_pressure:
+                        reason = f"RAM %{system_memory.percent:.1f} < eşik %{mode['ram_percent']:.1f}"
+                    elif gpu_busy:
+                        reason = "GPU yükü koruma eşiğinde"
+                    elif trim_eligible == 0:
+                        reason = "Uygun süreç bulunamadı"
+                    elif optimized_count == 0:
+                        reason = "Trim denemeleri Windows tarafından reddedildi"
+                    else:
+                        reason = f"{optimized_count} süreçte trim uygulandı"
+                    self._last_optimization_data = {
+                        "status": "Test pass" if test_mode else "Pass complete",
+                        "reason": reason,
+                        "scanned": trim_scanned,
+                        "eligible": trim_eligible,
+                        "trimmed": optimized_count,
+                        "skipped": trim_skipped,
+                        "skipped_model": skipped_model,
+                        "skipped_size": skipped_size,
+                        "skipped_cooldown": skipped_cooldown,
+                        "attempted": trim_attempted,
+                        "failed": trim_failed,
+                    }
                     self._last_optimization_at = now_monotonic
                 connection.commit()
                 dashboard_data = {
@@ -1272,6 +1413,7 @@ class EventDrivenTelemetryWorker(QThread):
             "focus_started_at": self._focus_started_at,
             "active_focus_name": self._active_focus_name,
             "active_focus_pid": self._active_focus_pid,
+            **self._last_optimization_data,
         }
         runtime.update({
             "fg_name": runtime.get("fg_name", self._active_focus_name),
@@ -1646,30 +1788,30 @@ class RamOptimizerApp(QMainWindow):
 
     def init_ui(self):
         self.setWindowTitle(self.t("title"))
-        self.setFixedSize(760, 860)
+        self.setFixedSize(700, 820)
 
         font_path = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", "segoeui.ttf")
         font_id = QFontDatabase.addApplicationFont(font_path)
         font_families = QFontDatabase.applicationFontFamilies(font_id) if font_id >= 0 else []
         font_family = font_families[0] if font_families else "Segoe UI"
-        QApplication.instance().setFont(QFont(font_family, 9))
+        QApplication.instance().setFont(QFont(font_family, 8))
 
         self.setStyleSheet("""
             QMainWindow { background-color: #10141c; }
             QLabel {
                 color: #d7dee9;
                 background-color: transparent;
-                font-size: 9pt;
+                font-size: 8pt;
             }
             QFrame, QWidget#infoCard {
                 background-color: #1b2330;
                 border: 1px solid #2b3747;
-                border-radius: 8px;
+                border-radius: 6px;
             }
             QPushButton {
                 background-color: #4f8cc9; color: #f7fbff; font-weight: 600;
-                border: 0; border-radius: 4px; padding: 3px 8px;
-                min-height: 22px; font-size: 8.5pt;
+                border: 0; border-radius: 5px; padding: 2px 6px;
+                min-height: 20px; font-size: 8pt;
             }
             QPushButton:hover { background-color: #65a2df; }
             QPushButton:disabled { background-color: #344253; color: #93a0af; }
@@ -1683,12 +1825,12 @@ class RamOptimizerApp(QMainWindow):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
-        main_layout.setContentsMargins(10, 10, 10, 10)
-        main_layout.setSpacing(4)
+        main_layout.setContentsMargins(8, 8, 8, 8)
+        main_layout.setSpacing(3)
 
         # Header.
         title_label = QLabel(self.t("title"))
-        title_label.setFont(QFont(font_family, 13, QFont.Weight.Bold))
+        title_label.setFont(QFont(font_family, 11, QFont.Weight.Bold))
         title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         main_layout.addWidget(title_label)
 
@@ -1696,8 +1838,8 @@ class RamOptimizerApp(QMainWindow):
         frame1 = QWidget()
         frame1.setObjectName("infoCard")
         layout1 = QVBoxLayout(frame1)
-        layout1.setContentsMargins(10, 8, 10, 8)
-        layout1.setSpacing(3)
+        layout1.setContentsMargins(8, 6, 8, 6)
+        layout1.setSpacing(1)
         self.lbl_status = QLabel("Agent status: Collecting and monitoring")
         self.lbl_status.setStyleSheet("color: #a6e3a1; font-weight: bold;")
         self.lbl_focus = QLabel("Foreground application: -")
@@ -1707,7 +1849,7 @@ class RamOptimizerApp(QMainWindow):
         self.lbl_prediction = QLabel("Next application prediction: Not enough data yet")
         for label in (self.lbl_status, self.lbl_focus, self.lbl_window, self.lbl_pid,
                       self.lbl_mode, self.lbl_prediction):
-            label.setMinimumHeight(18)
+            label.setMinimumHeight(15)
             label.setWordWrap(True)
             label.raise_()
         layout1.addWidget(self.lbl_status)
@@ -1721,8 +1863,8 @@ class RamOptimizerApp(QMainWindow):
         telemetry_frame = QWidget()
         telemetry_frame.setObjectName("infoCard")
         telemetry_layout = QVBoxLayout(telemetry_frame)
-        telemetry_layout.setContentsMargins(10, 8, 10, 8)
-        telemetry_layout.setSpacing(3)
+        telemetry_layout.setContentsMargins(8, 6, 8, 6)
+        telemetry_layout.setSpacing(1)
         self.lbl_sustained_focus = QLabel("Hold: - (0.0s of 2.0s threshold)")
         self.lbl_sustained_focus.setStyleSheet("color: #65a2df; font-weight: bold;")
         self.lbl_promotions = QLabel("Promoted Apps: 0")
@@ -1730,9 +1872,33 @@ class RamOptimizerApp(QMainWindow):
         self.lbl_trims = QLabel("RAM Trims: 0 triggers | 0.0 MB Freed")
         for label in (self.lbl_sustained_focus, self.lbl_promotions,
                       self.lbl_resets, self.lbl_trims):
-            label.setMinimumHeight(18)
+            label.setMinimumHeight(15)
             telemetry_layout.addWidget(label)
         main_layout.addWidget(telemetry_frame)
+
+        inspector_frame = QWidget()
+        inspector_frame.setObjectName("infoCard")
+        inspector_layout = QVBoxLayout(inspector_frame)
+        inspector_layout.setContentsMargins(8, 6, 8, 6)
+        inspector_layout.setSpacing(1)
+        self.lbl_decision_title = QLabel(self.t("decision_inspector"))
+        self.lbl_decision_title.setStyleSheet("color: #65a2df; font-weight: bold;")
+        self.lbl_decision_pass = QLabel(self.t("decision_waiting"))
+        self.lbl_decision_params = QLabel()
+        self.lbl_decision_counts = QLabel()
+        self.lbl_decision_reason = QLabel()
+        for label in (
+            self.lbl_decision_pass, self.lbl_decision_params,
+            self.lbl_decision_counts, self.lbl_decision_reason,
+        ):
+            label.setWordWrap(True)
+            label.setMinimumHeight(15)
+        inspector_layout.addWidget(self.lbl_decision_title)
+        inspector_layout.addWidget(self.lbl_decision_pass)
+        inspector_layout.addWidget(self.lbl_decision_params)
+        inspector_layout.addWidget(self.lbl_decision_counts)
+        inspector_layout.addWidget(self.lbl_decision_reason)
+        main_layout.addWidget(inspector_frame)
 
         self.dashboard_log_view = QTextEdit()
         self.dashboard_log_view.setReadOnly(True)
@@ -1750,8 +1916,8 @@ class RamOptimizerApp(QMainWindow):
         frame2 = QWidget()
         frame2.setObjectName("infoCard")
         layout2 = QVBoxLayout(frame2)
-        layout2.setContentsMargins(10, 8, 10, 8)
-        layout2.setSpacing(3)
+        layout2.setContentsMargins(8, 6, 8, 6)
+        layout2.setSpacing(1)
         self.lbl_ram = QLabel("RAM usage: 0% (0 MB)")
         self.lbl_ai_candidates = QLabel("AI compression candidates: 0 processes")
         self.lbl_ai_candidates.setStyleSheet("color: #f9e2af; font-weight: bold;")
@@ -1762,7 +1928,7 @@ class RamOptimizerApp(QMainWindow):
         for label in (self.lbl_ram, self.lbl_ai_candidates, self.lbl_optimized,
                       self.lbl_released_memory, self.lbl_process_count,
                       self.lbl_lowered_priority):
-            label.setMinimumHeight(18)
+            label.setMinimumHeight(15)
             label.raise_()
         layout2.addWidget(self.lbl_ram)
         layout2.addWidget(self.lbl_ai_candidates)
@@ -1775,8 +1941,8 @@ class RamOptimizerApp(QMainWindow):
         # Card 3: automatic training status.
         frame3 = QFrame()
         layout3 = QVBoxLayout(frame3)
-        layout3.setContentsMargins(10, 8, 10, 8)
-        layout3.setSpacing(4)
+        layout3.setContentsMargins(8, 6, 8, 6)
+        layout3.setSpacing(2)
         self.lbl_train_status = QLabel("Model training: Idle (Interval: 15 min)")
         self.lbl_train_status.setFont(QFont(font_family, 9))
         self.btn_train = QPushButton("Train Again")
@@ -1785,28 +1951,33 @@ class RamOptimizerApp(QMainWindow):
         layout3.addWidget(self.btn_train)
         main_layout.addWidget(frame3)
 
+        button_grid = QGridLayout()
+        button_grid.setContentsMargins(0, 0, 0, 0)
+        button_grid.setHorizontalSpacing(4)
+        button_grid.setVerticalSpacing(3)
+
         self.btn_collection = QPushButton("Pause Data Collection")
         self.btn_collection.clicked.connect(self.toggle_collection)
-        main_layout.addWidget(self.btn_collection)
+        button_grid.addWidget(self.btn_collection, 0, 0)
 
         self.btn_optimize_now = QPushButton(self.t("optimize_now"))
         self.btn_optimize_now.clicked.connect(self.optimize_now)
-        main_layout.addWidget(self.btn_optimize_now)
+        button_grid.addWidget(self.btn_optimize_now, 0, 1)
 
         self.btn_live_telemetry = QPushButton(self.t("live_telemetry"))
         self.btn_live_telemetry.clicked.connect(self.show_live_telemetry)
-        main_layout.addWidget(self.btn_live_telemetry)
+        button_grid.addWidget(self.btn_live_telemetry, 1, 0)
 
         self.btn_delete_database = QPushButton("Delete Personal Data and Model")
         self.btn_delete_database.setObjectName("dangerButton")
         self.btn_delete_database.clicked.connect(self.delete_database)
-        main_layout.addWidget(self.btn_delete_database)
+        button_grid.addWidget(self.btn_delete_database, 1, 1)
 
         # Windows autostart button.
         self.btn_autostart = QPushButton("Start with Windows: " + ("ON" if is_autostart_enabled() else "OFF"))
         if is_autostart_enabled(): self.btn_autostart.setObjectName("autostartActive")
         self.btn_autostart.clicked.connect(self.toggle_autostart)
-        main_layout.addWidget(self.btn_autostart)
+        button_grid.addWidget(self.btn_autostart, 2, 0)
 
         self.btn_settings = QPushButton("Settings: Balanced")
         self.settings_menu = QMenu(self)
@@ -1848,7 +2019,8 @@ class RamOptimizerApp(QMainWindow):
         self.custom_profile_action.triggered.connect(self.create_custom_profile)
         self.settings_menu.addAction(self.custom_profile_action)
         self.btn_settings.setMenu(self.settings_menu)
-        main_layout.addWidget(self.btn_settings)
+        button_grid.addWidget(self.btn_settings, 2, 1)
+        main_layout.addLayout(button_grid)
 
         self.create_tray_icon()
 
@@ -1871,7 +2043,8 @@ class RamOptimizerApp(QMainWindow):
 
         self.telemetry_dialog = QDialog(self)
         self.telemetry_dialog.setWindowTitle(self.t("live_telemetry_title"))
-        self.telemetry_dialog.setMinimumSize(620, 420)
+        self.telemetry_dialog.setMinimumSize(560, 360)
+        self.telemetry_dialog.resize(680, 420)
         layout = QVBoxLayout(self.telemetry_dialog)
         self.telemetry_log_view = QTextEdit()
         self.telemetry_log_view.setReadOnly(True)
@@ -1879,7 +2052,7 @@ class RamOptimizerApp(QMainWindow):
         self.telemetry_log_view.document().setMaximumBlockCount(1000)
         self.telemetry_log_view.setStyleSheet(
             "QTextEdit { background-color: #0d1117; color: #b9f6ca; "
-            "border: 1px solid #344253; font-family: Consolas; font-size: 10pt; }"
+            "border: 1px solid #344253; font-family: Consolas; font-size: 9pt; }"
         )
         layout.addWidget(self.telemetry_log_view)
         self.telemetry_status = QLabel()
@@ -1916,14 +2089,27 @@ class RamOptimizerApp(QMainWindow):
         ) if view is not None]
         if not views:
             return
-        if "Bellek temizlendi" in message:
-            color = "#ff4d6d"
-        elif "PROMOTION" in message:
+        normalized = message.casefold()
+        if any(keyword in normalized for keyword in (
+            "ram trim", "bellek temizlendi", "ram azaltıldı", "memory released",
+        )):
+            color = "#ff6b81"
+        elif "promotion" in normalized or "high priority" in normalized:
             color = "#65a2df"
-        elif "DEMOTION" in message or "Öncelik düşürüldü" in message:
+        elif any(keyword in normalized for keyword in (
+            "demotion", "öncelik düşürüldü", "priority normale", "below normal",
+        )):
             color = "#ffb347"
-        elif "AI" in message or "optimizasyon" in message:
+        elif any(keyword in normalized for keyword in (
+            "skip", "atlandı", "korunuyor", "rejected", "hata", "error", "failure",
+        )):
+            color = "#c792ea"
+        elif "ai" in normalized or "optimizasyon" in normalized:
             color = "#f9e2af"
+        elif any(keyword in normalized for keyword in (
+            "odak", "focus", "geçiş", "transition",
+        )):
+            color = "#56d4dd"
         else:
             color = "#b9f6ca"
         formatted = f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {message}"
@@ -1993,6 +2179,36 @@ class RamOptimizerApp(QMainWindow):
         self.lbl_trims.setText(
             f"RAM Trims: {data.get('ram_trims_count', 0)} triggers | "
             f"{data.get('accumulated_suppression_mb', 0.0):.1f} MB Freed"
+        )
+        mode_config = OPTIMIZATION_MODES[self.optimization_mode]
+        self.lbl_decision_title.setText(self.t("decision_inspector"))
+        self.lbl_decision_pass.setText(
+            self.t("decision_pass").format(status=data.get("status", "Waiting"))
+        )
+        self.lbl_decision_params.setText(
+            self.t("decision_params").format(
+                threshold=mode_config["ram_percent"],
+                interval=mode_config["interval_sec"],
+                cooldown=mode_config["trim_cooldown_sec"],
+                background=mode_config["background_sec"],
+            )
+        )
+        self.lbl_decision_counts.setText(
+            self.t("decision_counts").format(
+                scanned=data.get("scanned", 0),
+                candidates=data.get("candidates_count", 0),
+                eligible=data.get("eligible", 0),
+                trimmed=data.get("trimmed", 0),
+                skipped=data.get("skipped", 0),
+                model=data.get("skipped_model", 0),
+                size=data.get("skipped_size", 0),
+                cooldown=data.get("skipped_cooldown", 0),
+            )
+        )
+        self.lbl_decision_reason.setText(
+            self.t("decision_reason").format(
+                reason=data.get("reason", self.t("decision_waiting"))
+            )
         )
         self.update_focus_clock()
 
